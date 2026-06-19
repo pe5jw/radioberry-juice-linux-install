@@ -1,0 +1,32 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.rbf.bak
+
+# OS bestanden
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor bestanden
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Lokale config / secrets
+*.env
+*.token
+.secrets
+
+# Tijdelijke bestanden
+*.tmp
+*.log
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
