@@ -6,19 +6,14 @@
 # Gebaseerd op het werk van Johan PA3GSB - https://www.pa3gsb.nl
 # GitHub: https://github.com/pa3gsb/Radioberry-2.x
 #
-# Wat dit script doet:
-#   1. Pi model detecteren (Pi4 / Pi5)
-#   2. Vereiste pakketten installeren (libftdi, build tools, GPIO libs)
-#   3. ftdi_sio kernelmodule blokkeren
-#   4. udev regels instellen voor FT2232H
-#   5. Radioberry Juice firmware downloaden en bouwen
-#   6. Gateware (.rbf) installeren
-#   7. Systemd service aanmaken
-#   8. Optioneel: piHPSDR / Quisk installeren
-#
 # Ondersteund:
-#   - Raspberry Pi 4 (Raspberry Pi OS Bullseye / Bookworm)
-#   - Raspberry Pi 5 (Raspberry Pi OS Bookworm)
+#   Raspberry Pi 4  - Raspberry Pi OS Bookworm (Debian 12) of Trixie (Debian 13)
+#   Raspberry Pi 5  - Raspberry Pi OS Bookworm (Debian 12) of Trixie (Debian 13)
+#
+# Pi OS versies:
+#   Bookworm (Debian 12) - uitgebracht okt 2023, laatste update mei 2025
+#   Trixie   (Debian 13) - uitgebracht okt 2025, huidig standaard [aanbevolen]
+#
 # =============================================================================
 
 set -e
@@ -50,14 +45,14 @@ if [ "$EUID" -eq 0 ]; then
 fi
 
 # =============================================================================
-# Pi model detecteren
+# Pi model en OS versie detecteren
 # =============================================================================
 detect_pi_model() {
   if [ ! -f /proc/device-tree/model ]; then
     error "Geen Raspberry Pi gedetecteerd. Dit script is alleen voor RPi 4/5."
   fi
   PI_MODEL=$(cat /proc/device-tree/model)
-  info "Hardware gedetecteerd: $PI_MODEL"
+  info "Hardware: $PI_MODEL"
 
   if echo "$PI_MODEL" | grep -q "Raspberry Pi 5"; then
     PI_VERSION=5
@@ -67,26 +62,45 @@ detect_pi_model() {
     log "Raspberry Pi 4 gedetecteerd."
   elif echo "$PI_MODEL" | grep -q "Raspberry Pi 3"; then
     PI_VERSION=3
-    warn "Raspberry Pi 3 gedetecteerd. Niet officieel ondersteund, doorgaan op eigen risico."
-    PI_VERSION=3
+    warn "Raspberry Pi 3 gedetecteerd - niet officieel ondersteund, doorgaan op eigen risico."
   else
     error "Onbekend Pi model: $PI_MODEL. Dit script ondersteunt Pi 4 en Pi 5."
   fi
 }
 
-# OS versie bepalen
 detect_os() {
-  if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS_CODENAME=${VERSION_CODENAME:-unknown}
-    info "OS: $PRETTY_NAME (codename: $OS_CODENAME)"
-  else
+  if [ ! -f /etc/os-release ]; then
     error "Kan OS niet bepalen."
   fi
+  . /etc/os-release
+  OS_CODENAME=${VERSION_CODENAME:-unknown}
+  OS_VERSION=${VERSION_ID:-unknown}
+  info "OS: $PRETTY_NAME"
+
+  case "$OS_CODENAME" in
+    trixie)
+      log "Raspberry Pi OS Trixie (Debian 13) - huidig aanbevolen, volledig ondersteund." ;;
+    bookworm)
+      log "Raspberry Pi OS Bookworm (Debian 12) - ondersteund." ;;
+    bullseye)
+      warn "Raspberry Pi OS Bullseye (Debian 11) - verouderd. Upgrade naar Trixie aanbevolen." ;;
+    buster)
+      error "Raspberry Pi OS Buster (Debian 10) is EOL en niet ondersteund. Installeer Trixie." ;;
+    *)
+      warn "Onbekende OS versie '$OS_CODENAME' - doorgaan op eigen risico." ;;
+  esac
 }
 
 detect_pi_model
 detect_os
+
+# Bepaal boot config locatie (verschilt per OS versie)
+if [ -f /boot/firmware/config.txt ]; then
+  BOOT_CONFIG="/boot/firmware/config.txt"   # Bookworm en Trixie
+else
+  BOOT_CONFIG="/boot/config.txt"            # Bullseye en ouder
+fi
+info "Boot config: $BOOT_CONFIG"
 
 # =============================================================================
 # STAP 1: Systeem updaten en pakketten installeren
@@ -97,7 +111,7 @@ title "STAP 1: Systeem updaten en pakketten installeren..."
 sudo apt-get update -qq
 sudo apt-get upgrade -y -qq
 
-# Basis build tools + FTDI + audio + GPIO
+# Basis pakketten
 PACKAGES="build-essential git cmake pkg-config wget unzip \
   libftdi1 libftdi1-dev \
   libusb-1.0-0 libusb-1.0-0-dev \
@@ -105,20 +119,25 @@ PACKAGES="build-essential git cmake pkg-config wget unzip \
   libasound2-dev \
   libpulse-dev \
   libgtk-3-dev \
-  libgpiod-dev"
+  i2c-tools"
 
-# Pi 5 heeft extra gpiod versie nodig (bookworm)
-if [ "$PI_VERSION" -ge 5 ]; then
-  PACKAGES="$PACKAGES python3-libgpiod gpiod"
-fi
-
-# Pi 4-specifiek: wiringPi alternatief via lgpio op bookworm
-if [ "$OS_CODENAME" = "bookworm" ]; then
-  PACKAGES="$PACKAGES liblgpio-dev"
-fi
+# Trixie (Debian 13) specifiek: lgpio vervangt wiringPi volledig
+# Bookworm had lgpio al, Trixie is de standaard
+case "$OS_CODENAME" in
+  trixie)
+    PACKAGES="$PACKAGES libgpiod-dev gpiod liblgpio-dev python3-libgpiod"
+    ;;
+  bookworm)
+    PACKAGES="$PACKAGES libgpiod-dev gpiod liblgpio-dev python3-libgpiod"
+    ;;
+  bullseye)
+    PACKAGES="$PACKAGES libgpiod-dev gpiod"
+    # wiringPi is deprecated op bullseye maar soms nog aanwezig
+    ;;
+esac
 
 sudo apt-get install -y $PACKAGES
-log "Pakketten geïnstalleerd."
+log "Pakketten geinstalleerd."
 
 # =============================================================================
 # STAP 2: ftdi_sio kernelmodule blokkeren
@@ -139,7 +158,6 @@ else
   log "Blacklist bestaat al."
 fi
 
-# Verwijder de module als geladen
 if lsmod | grep -q ftdi_sio; then
   sudo rmmod ftdi_sio 2>/dev/null || warn "Kon ftdi_sio niet verwijderen, herstart vereist."
 fi
@@ -160,7 +178,6 @@ EOF
 
 log "udev regels geschreven: $UDEV_FILE"
 
-# Gebruiker in plugdev groep
 if ! groups "$USER" | grep -q plugdev; then
   sudo usermod -a -G plugdev "$USER"
   log "Gebruiker $USER toegevoegd aan plugdev."
@@ -168,10 +185,14 @@ else
   log "Gebruiker $USER is al lid van plugdev."
 fi
 
-# Gebruiker ook in gpio groep (Pi specifiek)
 if ! groups "$USER" | grep -q gpio; then
   sudo usermod -a -G gpio "$USER"
   log "Gebruiker $USER toegevoegd aan gpio groep."
+fi
+
+if ! groups "$USER" | grep -q i2c; then
+  sudo usermod -a -G i2c "$USER"
+  log "Gebruiker $USER toegevoegd aan i2c groep."
 fi
 
 sudo udevadm control --reload-rules
@@ -195,19 +216,18 @@ if [ ! -d "Radioberry-2.x" ]; then
 else
   info "Repository bestaat al, updaten..."
   cd Radioberry-2.x && git pull && cd ..
-  log "Repository geüpdatet."
+  log "Repository geupdate."
 fi
 
 cd Radioberry-2.x/juice/firmware
 
-# linux-Makefile is bedoeld voor RPi en Linux
 if [ ! -f "linux-Makefile" ]; then
   error "linux-Makefile niet gevonden in juice/firmware. Controleer de repository."
 fi
 
 cp linux-Makefile Makefile
 
-info "Firmware bouwen voor Pi $PI_VERSION..."
+info "Firmware bouwen voor Pi $PI_VERSION ($OS_CODENAME)..."
 make clean 2>/dev/null || true
 make
 
@@ -227,7 +247,6 @@ sudo cp radioberry-juice /usr/local/bin/radioberry-juice
 sudo chmod +x /usr/local/bin/radioberry-juice
 log "Firmware: /usr/local/bin/radioberry-juice"
 
-# Gateware zoeken
 RBF_FILE=$(find "$INSTALL_DIR/Radioberry-2.x" -name "radioberry.rbf" | head -1)
 sudo mkdir -p /etc/radioberry
 
@@ -241,37 +260,34 @@ else
 fi
 
 # =============================================================================
-# STAP 6: SPI / I2C inschakelen (Pi-specifiek, voor preamp board)
+# STAP 6: SPI / I2C inschakelen
 # =============================================================================
 echo ""
-title "STAP 6: SPI en I2C interfaces inschakelen (voor preamp board)..."
+title "STAP 6: SPI en I2C inschakelen (voor preamp board)..."
 
-# SPI inschakelen
-if ! grep -q "^dtparam=spi=on" /boot/firmware/config.txt 2>/dev/null && \
-   ! grep -q "^dtparam=spi=on" /boot/config.txt 2>/dev/null; then
-  BOOT_CONFIG="/boot/firmware/config.txt"
-  [ ! -f "$BOOT_CONFIG" ] && BOOT_CONFIG="/boot/config.txt"
+# SPI
+if ! grep -q "^dtparam=spi=on" "$BOOT_CONFIG" 2>/dev/null; then
   echo "dtparam=spi=on" | sudo tee -a "$BOOT_CONFIG" > /dev/null
   log "SPI ingeschakeld in $BOOT_CONFIG"
 else
   log "SPI was al ingeschakeld."
 fi
 
-# I2C inschakelen
-if ! grep -q "^dtparam=i2c_arm=on" /boot/firmware/config.txt 2>/dev/null && \
-   ! grep -q "^dtparam=i2c_arm=on" /boot/config.txt 2>/dev/null; then
-  BOOT_CONFIG="/boot/firmware/config.txt"
-  [ ! -f "$BOOT_CONFIG" ] && BOOT_CONFIG="/boot/config.txt"
+# I2C
+if ! grep -q "^dtparam=i2c_arm=on" "$BOOT_CONFIG" 2>/dev/null; then
   echo "dtparam=i2c_arm=on" | sudo tee -a "$BOOT_CONFIG" > /dev/null
   log "I2C ingeschakeld in $BOOT_CONFIG"
 else
   log "I2C was al ingeschakeld."
 fi
 
-sudo apt-get install -y -qq i2c-tools
-if ! groups "$USER" | grep -q i2c; then
-  sudo usermod -a -G i2c "$USER"
-  log "Gebruiker $USER toegevoegd aan i2c groep."
+# Pi 5 specifiek: I2C bus op Trixie via RP1 controller
+if [ "$PI_VERSION" -eq 5 ] && [ "$OS_CODENAME" = "trixie" ]; then
+  info "Pi 5 Trixie: controleer of i2c-dev module geladen wordt..."
+  if ! grep -q "i2c-dev" /etc/modules 2>/dev/null; then
+    echo "i2c-dev" | sudo tee -a /etc/modules > /dev/null
+    log "i2c-dev toegevoegd aan /etc/modules"
+  fi
 fi
 
 # =============================================================================
@@ -312,8 +328,8 @@ title "STAP 8: SDR software installeren (optioneel)..."
 
 echo ""
 echo "Welke SDR software wil je installeren?"
-echo "  1) piHPSDR  (aanbevolen voor RPi, ondersteunt Radioberry native)"
-echo "  2) Quisk    (Python SDR, ondersteunt OpenHPSDR Protocol-1)"
+echo "  1) piHPSDR  (aanbevolen voor RPi, native Radioberry support)"
+echo "  2) Quisk    (Python SDR, OpenHPSDR Protocol-1)"
 echo "  3) Beide"
 echo "  4) Overslaan"
 echo ""
@@ -321,9 +337,17 @@ read -rp "Keuze [1/2/3/4]: " SDR_CHOICE
 
 install_pihpsdr() {
   info "piHPSDR installeren..."
-  sudo apt-get install -y -qq libcairo2-dev libjpeg-dev libglib2.0-dev \
-    libpango1.0-dev libatk1.0-dev libsoup2.4-dev portaudio19-dev \
-    libwdsp-dev || true
+  PIHPSDR_DEPS="libcairo2-dev libjpeg-dev libglib2.0-dev \
+    libpango1.0-dev libatk1.0-dev portaudio19-dev"
+
+  # libasound2-dev naam verschilt op trixie
+  if [ "$OS_CODENAME" = "trixie" ]; then
+    PIHPSDR_DEPS="$PIHPSDR_DEPS libasound2-dev"
+  else
+    PIHPSDR_DEPS="$PIHPSDR_DEPS libasound2-dev"
+  fi
+
+  sudo apt-get install -y -qq $PIHPSDR_DEPS || true
 
   cd "$INSTALL_DIR"
   if [ ! -d "pihpsdr" ]; then
@@ -334,14 +358,14 @@ install_pihpsdr() {
   cd pihpsdr
   make -j$(nproc)
   sudo cp pihpsdr /usr/local/bin/pihpsdr
-  log "piHPSDR geïnstalleerd: /usr/local/bin/pihpsdr"
+  log "piHPSDR geinstalleerd: /usr/local/bin/pihpsdr"
 }
 
 install_quisk() {
   info "Quisk installeren..."
   sudo apt-get install -y -qq python3-pip python3-pyaudio python3-numpy python3-scipy
   pip3 install quisk --break-system-packages 2>/dev/null || pip3 install quisk
-  log "Quisk geïnstalleerd."
+  log "Quisk geinstalleerd."
 }
 
 case "$SDR_CHOICE" in
@@ -358,41 +382,45 @@ esac
 echo ""
 echo "============================================================"
 echo -e "  ${GREEN}Installatie voltooid!${NC}"
-echo "  Raspberry Pi $PI_VERSION - $OS_CODENAME"
+echo "  Hardware : Raspberry Pi $PI_VERSION"
+echo "  OS       : $PRETTY_NAME"
 echo "============================================================"
 echo ""
 echo "  Hardware aansluiting:"
 echo "    - Radioberry 2.x kaart op Juice Board gestoken"
 echo "    - Juice Board via USB-A kabel aan RPi verbonden"
 echo "    - Voeding Juice Board: 12V DC (eigen voeding!)"
-echo "    - Optioneel: preamp board op Radioberry (I2C pin 15/16)"
+echo "    - Optioneel: preamp board op Radioberry (I2C)"
 echo ""
-echo "  BELANGRIJK - Herstart vereist!"
-echo "    sudo reboot"
+echo "  HERSTART VEREIST voor:"
+echo "    - Groepswijzigingen (plugdev, gpio, i2c)"
+echo "    - SPI/I2C activering"
+echo "    - ftdi_sio blacklist"
+echo ""
+echo "  sudo reboot"
 echo ""
 echo "  Na herstart:"
-echo "    lsusb | grep FTDI              # Juice board zichtbaar? (0403:6010)"
-echo "    radioberry-juice               # Firmware starten (laadt FPGA gateware)"
-echo "    pihpsdr                        # SDR software starten (indien geïnstalleerd)"
+echo "    lsusb | grep FTDI              # Juice board? (0403:6010)"
+echo "    radioberry-juice               # FPGA laden en starten"
+echo "    i2cdetect -y 1                 # Preamp board controleren"
 echo ""
-echo "  Autostart inschakelen:"
+echo "  Autostart:"
 echo "    sudo systemctl enable radioberry-juice"
 echo "    sudo systemctl start radioberry-juice"
 echo "    sudo systemctl status radioberry-juice"
 echo ""
-echo "  I2C preamp board controleren:"
-echo "    i2cdetect -y 1"
-echo ""
-echo "  Pi $PI_VERSION specifieke opmerkingen:"
+
 if [ "$PI_VERSION" -eq 5 ]; then
-echo "    - Pi 5 gebruikt RP1 I/O controller (andere GPIO pinout dan Pi 4)"
-echo "    - USB 3.0 poorten geven hogere bandbreedte voor IQ streaming"
-echo "    - Gebruik bij voorkeur de USB 2.0 poort voor de Juice Board"
-echo "      (FT2232H is USB 2.0 High Speed, 480 Mbps)"
+  echo "  Pi 5 opmerkingen:"
+  echo "    - USB 2.0 poort aanbevolen voor Juice Board (FT2232H is USB 2.0)"
+  echo "    - Pi 5 gebruikt RP1 I/O controller (eigen GPIO driver, lgpio)"
+  echo "    - Trixie OS is de aanbevolen versie voor Pi 5"
 elif [ "$PI_VERSION" -eq 4 ]; then
-echo "    - Pi 4 USB 3.0 poorten volledig ondersteund voor IQ streaming"
-echo "    - Bij thermische problemen: actieve koeling aanbevolen"
+  echo "  Pi 4 opmerkingen:"
+  echo "    - Alle USB 3.0 poorten werken prima voor de Juice Board"
+  echo "    - Bij hoge CPU load: actieve koeling aanbevolen"
 fi
+
 echo ""
 echo "  Nuttige links:"
 echo "    Website:  https://www.pa3gsb.nl"
