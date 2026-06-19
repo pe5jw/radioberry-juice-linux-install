@@ -1,0 +1,33 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**.sh'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - '**.sh'
+
+jobs:
+  shellcheck:
+    name: ShellCheck Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck on Linux install script
+        run: |
+          shellcheck -S warning radioberry_juice_linux_install.sh
+          echo "Linux script: OK"
+
+      - name: Run ShellCheck on RPi install script
+        run: |
+          shellcheck -S warning radioberry_juice_rpi_install.sh
+          echo "RPi script: OK"
